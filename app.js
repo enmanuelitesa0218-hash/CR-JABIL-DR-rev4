@@ -13,9 +13,11 @@ let appTechnicians = [];
 let productivityData = {};
 let downtimeData = {}; 
 let wipData = {}; // Nuevo: Datos de WIP desde Excel
+let engineerActions = []; // Nuevo: Acciones 4Q
 let productivityChartInstance = null;
 let downtimeChartInstance = null; 
 let wipChartInstance = null; // Nuevo: Gráfica de WIP
+let miniWipChartInstance = null; // Nuevo: Gráfica mini para 4Q
 let shiftGoal = 0; 
 
 // ------------------------------------------
@@ -117,6 +119,14 @@ function setupFirebaseListeners() {
         if (tsEl && timestamp) tsEl.textContent = `Actualizado: ${timestamp}`;
         
         if (document.getElementById('grafica-view')?.classList.contains('active')) renderWipChart();
+        if (document.getElementById('actions-view')?.classList.contains('active')) renderMiniWipChart();
+    });
+    // Escuchar Acciones 4Q en tiempo real
+    window.db.ref('actions').on('value', (snapshot) => {
+        const data = snapshot.val() || {};
+        engineerActions = Object.keys(data).map(k => ({ ...data[k], pushKey: k }));
+        renderActionsTable();
+        renderActionsSummary();
     });
 }
 
@@ -290,7 +300,7 @@ function updateKPIs() {
     let totalEffPct = 0;
     let techsWithGoal = 0;
     const hoursWorked = Math.max(0.5, now.getHours() + now.getMinutes() / 60 - 7);
-    const hoursLeft = Math.max(0, 15 - now.getHours() - now.getMinutes() / 60);
+    const hoursLeft = Math.max(0, 23.8 - now.getHours() - now.getMinutes() / 60);
     let teamProjection = 0;
 
     appTechnicians.forEach(tech => {
@@ -369,6 +379,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initForm();
     initAdmin();
     initHistorial();
+    initActions();
 
     // Poblar inicial con caché si existe
     const cached = localStorage.getItem('jabil_techs_list');
@@ -506,8 +517,12 @@ function initNavigation() {
                 }
                 if (targetId === 'paradas-view') renderDowntimeTable();
                 if (targetId === 'historial-view') renderHistorial();
+                if (targetId === 'actions-view') {
+                    renderActionsTable();
+                    renderMiniWipChart();
+                }
             };
-            if (targetId === 'tecnicos-view') window.showAdminAuthModal(action);
+            if (targetId === 'tecnicos-view' || targetId === 'actions-view') window.showAdminAuthModal(action);
             else action();
         });
     });
@@ -896,7 +911,13 @@ function renderWipChart() {
     if (!canvas) return;
 
     // wipData ahora es { "ASSY1": { "To Diag": 5, "To Repair": 2 }, ... }
-    const assemblies = Object.keys(wipData);
+    // ORDENAR: De mayor a menor total
+    const assemblies = Object.keys(wipData).sort((a, b) => {
+        const totalA = Object.values(wipData[a]).reduce((s, v) => s + v, 0);
+        const totalB = Object.values(wipData[b]).reduce((s, v) => s + v, 0);
+        return totalB - totalA;
+    });
+
     const categories = ["To Diag", "To Repair", "To Test", "Otros"];
     
     const colors = {
@@ -906,12 +927,37 @@ function renderWipChart() {
         "Otros": "rgba(148, 163, 184, 0.5)"     // Gris
     };
 
+    const totalWip = assemblies.reduce((sum, assy) => {
+        return sum + Object.values(wipData[assy]).reduce((s, v) => s + v, 0);
+    }, 0);
+
+    let cumulative = 0;
+    const paretoData = assemblies.map(assy => {
+        const assyTotal = Object.values(wipData[assy]).reduce((s, v) => s + v, 0);
+        cumulative += assyTotal;
+        return (cumulative / totalWip) * 100;
+    });
+
     const datasets = categories.map(cat => ({
         label: cat,
         data: assemblies.map(assy => wipData[assy][cat] || 0),
         backgroundColor: colors[cat],
-        borderRadius: 4
+        borderRadius: 4,
+        stack: 'stack0'
     }));
+
+    // Agregar línea de Pareto (80/20)
+    datasets.push({
+        label: '% Acumulado (80/20)',
+        data: paretoData,
+        type: 'line',
+        borderColor: '#f59e0b',
+        borderWidth: 2,
+        pointRadius: 3,
+        yAxisID: 'y1',
+        fill: false,
+        stack: 'stack1'
+    });
 
     if (wipChartInstance) wipChartInstance.destroy();
     wipChartInstance = new Chart(canvas.getContext('2d'), {
@@ -925,11 +971,66 @@ function renderWipChart() {
             maintainAspectRatio: false,
             scales: {
                 x: { stacked: true, title: { display: true, text: 'Assembly Number' } },
-                y: { stacked: true, beginAtZero: true, title: { display: true, text: 'Unidades' } }
+                y: { stacked: true, beginAtZero: true, title: { display: true, text: 'Unidades' } },
+                y1: {
+                    position: 'right',
+                    beginAtZero: true,
+                    max: 100,
+                    title: { display: true, text: '% Acumulado' },
+                    grid: { drawOnChartArea: false },
+                    ticks: { callback: value => value + '%' }
+                }
             },
             plugins: {
                 legend: { position: 'top' },
                 tooltip: { mode: 'index', intersect: false }
+            }
+        }
+    });
+}
+
+function renderMiniWipChart() {
+    const canvas = document.getElementById('miniWipChart');
+    if (!canvas) return;
+
+    // Solo los primeros 4 detractores
+    const assemblies = Object.keys(wipData).sort((a, b) => {
+        const totalA = Object.values(wipData[a]).reduce((s, v) => s + v, 0);
+        const totalB = Object.values(wipData[b]).reduce((s, v) => s + v, 0);
+        return totalB - totalA;
+    }).slice(0, 4);
+
+    if (assemblies.length === 0) return;
+
+    const categories = ["To Diag", "To Repair", "To Test", "Otros"];
+    const colors = {
+        "To Diag": "rgba(59, 130, 246, 0.7)",
+        "To Repair": "rgba(245, 158, 11, 0.7)",
+        "To Test": "rgba(16, 185, 129, 0.7)",
+        "Otros": "rgba(148, 163, 184, 0.4)"
+    };
+
+    const datasets = categories.map(cat => ({
+        label: cat,
+        data: assemblies.map(assy => wipData[assy][cat] || 0),
+        backgroundColor: colors[cat],
+        stack: 'stack0'
+    }));
+
+    if (miniWipChartInstance) miniWipChartInstance.destroy();
+    miniWipChartInstance = new Chart(canvas.getContext('2d'), {
+        type: 'bar',
+        data: { labels: assemblies, datasets },
+        options: {
+            indexAxis: 'y', // Barra horizontal para espacios pequeños
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: { stacked: true },
+                y: { stacked: true }
+            },
+            plugins: {
+                legend: { display: false } // Ahorrar espacio
             }
         }
     });
@@ -1299,9 +1400,106 @@ function initHistorial() {
     const nowStr = new Date().toISOString().split('T')[0];
     const s = document.getElementById('hist-date-start');
     const e = document.getElementById('hist-date-end');
+    const t = document.getElementById('hist-tech-filter');
+    
     // Default: último mes
     const monthAgo = new Date();
     monthAgo.setMonth(monthAgo.getMonth() - 1);
     if (s) s.value = monthAgo.toISOString().split('T')[0];
     if (e) e.value = nowStr;
+
+    // Agregar listeners para refrescar al cambiar
+    [s, e, t].forEach(el => {
+        if (el) el.addEventListener('change', renderHistorial);
+    });
+}
+
+// ------------------------------------------
+// ACCIONES 4Q D&R
+// ------------------------------------------
+function initActions() {
+    const form = document.getElementById('action-form');
+    if (form) {
+        form.onsubmit = async (e) => {
+            e.preventDefault();
+            const action = {
+                date: new Date().toLocaleDateString('es-DO'),
+                area: document.getElementById('action-area').value,
+                category: document.getElementById('action-category').value,
+                desc: document.getElementById('action-desc').value,
+                owner: document.getElementById('action-owner').value,
+                status: document.getElementById('action-status').value,
+                timestamp: Date.now()
+            };
+
+            if (window.db) {
+                await window.db.ref('actions').push(action);
+                showToast("Acción guardada correctamente", "success");
+                form.reset();
+            } else {
+                alert("Sin conexión a Firebase");
+            }
+        };
+    }
+}
+
+function renderActionsTable() {
+    const body = document.getElementById('actions-table-body');
+    if (!body) return;
+
+    body.innerHTML = engineerActions.sort((a,b) => b.timestamp - a.timestamp).map(a => `
+        <tr>
+            <td>${a.date}</td>
+            <td><strong>${a.area}</strong> <small style="display:block; opacity:0.6;">${a.category}</small></td>
+            <td style="max-width:300px;">${a.desc}</td>
+            <td>${a.owner}</td>
+            <td>
+                <span style="padding:4px 10px; border-radius:12px; font-size:0.75rem; font-weight:600; 
+                    background:${a.status === 'Cerrado' ? 'rgba(34,197,94,0.2)' : a.status === 'En Proceso' ? 'rgba(245,158,11,0.2)' : 'rgba(239,68,68,0.2)'}; 
+                    color:${a.status === 'Cerrado' ? '#22c55e' : a.status === 'En Proceso' ? '#f59e0b' : '#ef4444'};">
+                    ${a.status}
+                </span>
+            </td>
+            <td>
+                <button onclick="deleteAction('${a.pushKey}')" class="nav-btn btn-danger" style="padding:5px 10px; margin:0;"><i class="fa-solid fa-trash"></i></button>
+            </td>
+        </tr>
+    `).join('');
+}
+
+function renderActionsSummary() {
+    const container = document.getElementById('actions-summary-list');
+    if (!container) return;
+
+    // Solo mostrar las abiertas o en proceso
+    const active = engineerActions.filter(a => a.status !== 'Cerrado').sort((a,b) => b.timestamp - a.timestamp).slice(0, 6);
+
+    if (active.length === 0) {
+        container.innerHTML = '<div style="grid-column: 1/-1; text-align:center; opacity:0.5; padding:20px;">No hay acciones pendientes de ingeniería.</div>';
+        return;
+    }
+
+    container.innerHTML = active.map(a => `
+        <div class="glass-panel" style="padding:15px; border-left:4px solid ${a.status === 'Abierto' ? '#ef4444' : '#f59e0b'};">
+            <div style="display:flex; justify-content:space-between; font-size:0.7rem; margin-bottom:8px;">
+                <span style="font-weight:700; color:var(--accent-primary);">${a.area} (${a.category})</span>
+                <span style="opacity:0.6;">${a.date}</span>
+            </div>
+            <p style="font-size:0.85rem; margin-bottom:10px; line-height:1.4;">${a.desc}</p>
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-size:0.75rem; font-weight:600;">${a.owner}</span>
+                <span style="font-size:0.7rem; color:${a.status === 'Abierto' ? '#ef4444' : '#f59e0b'}; font-weight:700;">${a.status.toUpperCase()}</span>
+            </div>
+        </div>
+    `).join('');
+}
+
+async function deleteAction(key) {
+    if (!confirm("¿Eliminar esta acción?")) return;
+    window.showAdminAuthModal(async () => {
+        if (window.db) {
+            await window.db.ref(`actions/${key}`).remove();
+            showToast("Acción eliminada", "success");
+        }
+    });
 }
